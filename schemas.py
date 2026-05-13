@@ -92,6 +92,7 @@ class UserInfo(BaseModel):
     uid: str
     email: Optional[str] = None
     is_admin: bool = False
+    is_disabled: bool = False
     created_at: Optional[datetime] = None
     
     model_config = ConfigDict(
@@ -100,6 +101,7 @@ class UserInfo(BaseModel):
                 "uid": "firebase_uid_123",
                 "email": "user@example.com",
                 "is_admin": False,
+                "is_disabled": False,
                 "created_at": "2026-05-09T10:00:00"
             }
         }
@@ -274,6 +276,42 @@ class ImportResponse(BaseModel):
                     {"row": 8, "message": "Niveau invalide"},
                     {"row": 13, "message": "Réponse correcte invalide"}
                 ]
+            }
+        }
+    )
+
+# ========== AI GENERATION SCHEMAS ==========
+
+class AIQuestionRequest(BaseModel):
+    """Modèle pour la requête de génération IA"""
+    theme: str
+    level: str  # beginner, intermediate, advanced
+    count: int
+    language: str = "fr"  # optionnel, français par défaut
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "theme": "mathématiques",
+                "level": "beginner",
+                "count": 5,
+                "language": "fr"
+            }
+        }
+    )
+
+class AIQuestionResponse(BaseModel):
+    """Modèle pour la réponse de génération IA"""
+    success: bool
+    generated: int
+    saved_as_draft: int
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "generated": 5,
+                "saved_as_draft": 5
             }
         }
     )

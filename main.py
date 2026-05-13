@@ -11,7 +11,8 @@ from schemas import (
     AnswerRequest, ScoreResponse, UserScoreResponse, LeaderboardEntry, StatsSummary,
     UserInfo, UserDetails, AdminActionResponse,
     QuestionAdminCreate, QuestionAdminUpdate, QuestionAdminResponse, QuestionAdminDeleteResponse,
-    ImportError, ImportResponse
+    ImportError, ImportResponse,
+    AIQuestionRequest, AIQuestionResponse
 )
 from contextlib import asynccontextmanager
 import firebase_admin
@@ -55,7 +56,8 @@ def get_current_user(user=Depends(verify_firebase_token)):
     return {
         "uid": user["uid"],
         "email": user.get("email"),
-        "provider": user.get("firebase", {}).get("sign_in_provider")
+        "provider": user.get("firebase", {}).get("sign_in_provider"),
+        "admin": user.get("admin", False)
     }
 
 
@@ -354,40 +356,36 @@ def get_my_summary(
 
 @app.get("/admin/users", response_model=List[UserInfo])
 def list_users(
-    db: Session = Depends(get_db),
     admin_user=Depends(require_admin)
 ):
     """
-    Liste tous les utilisateurs (admin uniquement).
-    Retourne les utilisateurs qui ont joué au moins une partie.
+    Liste tous les utilisateurs Firebase (admin uniquement).
+    Retourne TOUS les utilisateurs, qu'ils aient joué ou non.
     """
     try:
-        # Récupérer tous les user_id uniques depuis la table scores
-        user_ids = db.query(Score.user_id).distinct().all()
-        user_ids = [uid[0] for uid in user_ids]
-        
+        from datetime import datetime
         users_list = []
         
-        for uid in user_ids:
-            try:
-                # Appel Firebase unique pour récupérer l'utilisateur
-                user_record = firebase_auth.get_user(uid)
-                custom_claims = user_record.custom_claims or {}
-                is_admin = custom_claims.get("admin", False)
-                
-                users_list.append(UserInfo(
-                    uid=uid,
-                    email=user_record.email,
-                    is_admin=is_admin,
-                    created_at=user_record.user_metadata.creation_time
-                ))
-                
-            except firebase_auth.UserNotFoundError:
-                # Utilisateur Firebase non trouvé, ignorer
-                continue
-            except Exception as e:
-                # Erreur lors de la récupération, continuer avec les autres
-                continue
+        # Récupérer tous les utilisateurs Firebase via Admin SDK
+        page = firebase_auth.list_users()
+        
+        for user_record in page.users:
+            custom_claims = user_record.custom_claims or {}
+            is_admin = custom_claims.get("admin", False)
+            is_disabled = custom_claims.get("disabled", False)
+            
+            # Convertir le timestamp Firebase (millisecondes) en datetime Python
+            created_at = None
+            if user_record.user_metadata and hasattr(user_record.user_metadata, 'creation_timestamp'):
+                created_at = datetime.fromtimestamp(user_record.user_metadata.creation_timestamp / 1000)
+            
+            users_list.append(UserInfo(
+                uid=user_record.uid,
+                email=user_record.email,
+                is_admin=is_admin,
+                is_disabled=is_disabled,
+                created_at=created_at
+            ))
         
         return users_list
         
@@ -924,3 +922,85 @@ def import_questions_excel(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur lors de l'import Excel: {str(e)}")
+
+
+@app.post("/admin/questions/generate", response_model=AIQuestionResponse)
+def generate_questions_ai(
+    request: AIQuestionRequest,
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Génère des questions via IA (admin uniquement, mode assisté).
+    Les questions générées sont sauvegardées en brouillon (is_active = false).
+    L'admin doit les valider avant activation.
+    """
+    try:
+        from services.ai_service import ai_service
+        
+        # Valider le niveau
+        try:
+            level_enum = QuestionLevel(request.level.lower())
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Niveau invalide: {request.level}"
+            )
+        
+        # Valider le nombre de questions
+        if request.count < 1 or request.count > 20:
+            raise HTTPException(
+                status_code=400,
+                detail="Le nombre de questions doit être entre 1 et 20"
+            )
+        
+        # Générer les questions via IA
+        ai_questions = ai_service.generate_questions(
+            theme=request.theme,
+            level=request.level,
+            count=request.count,
+            language=request.language
+        )
+        
+        generated_count = len(ai_questions)
+        saved_count = 0
+        
+        # Sauvegarder les questions en brouillon
+        for q in ai_questions:
+            try:
+                new_question = Question(
+                    question=q["question"],
+                    option_a=q["option_a"],
+                    option_b=q["option_b"],
+                    option_c=q["option_c"],
+                    option_d=q["option_d"],
+                    correct_answer=q["correct"],
+                    level=level_enum,
+                    is_active=False  # Mode assisté : brouillon par défaut
+                )
+                
+                db.add(new_question)
+                saved_count += 1
+                
+            except Exception as e:
+                # Continuer avec les autres questions si une échoue
+                continue
+        
+        # Commit les questions sauvegardées
+        if saved_count > 0:
+            db.commit()
+        
+        return AIQuestionResponse(
+            success=True,
+            generated=generated_count,
+            saved_as_draft=saved_count
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de la génération IA: {str(e)}"
+        )
