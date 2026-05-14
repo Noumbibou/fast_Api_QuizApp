@@ -3,10 +3,17 @@ from typing import List, Optional
 from datetime import datetime
 
 class AnswerRequest(BaseModel):
-    """Modèle pour la requête de calcul de score"""
+    """Modèle pour la requête de calcul de score avec données anti-triche"""
     level: str
     session_key: str  # Clé de session pour récupérer les réponses mélangées
     answers: List[dict]  # [{"question_id": 1, "selected": "C"}]
+    
+    # Données anti-triche
+    cheated: bool = False  # Triche détectée par le frontend
+    time_spent: int = 0  # Temps total passé en secondes
+    latitude: Optional[float] = None  # Position GPS
+    longitude: Optional[float] = None  # Position GPS
+    camera_active: bool = True  # Caméra active pendant le quiz
     
     model_config = ConfigDict(
         json_schema_extra={
@@ -16,21 +23,30 @@ class AnswerRequest(BaseModel):
                 "answers": [
                     {"question_id": 1, "selected": "C"},
                     {"question_id": 2, "selected": "B"}
-                ]
+                ],
+                "cheated": False,
+                "time_spent": 30,
+                "latitude": 48.8566,
+                "longitude": 2.3522,
+                "camera_active": True
             }
         }
     )
 
 class ScoreResponse(BaseModel):
-    """Modèle pour la réponse de score"""
+    """Modèle pour la réponse de score avec indicateurs anti-triche"""
     score: int
     total: int
+    flagged: bool = False  # True si suspicion de triche
+    cheat_score: int = 0  # Score de suspicion (0-5+)
     
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "score": 7,
-                "total": 10
+                "total": 10,
+                "flagged": False,
+                "cheat_score": 0
             }
         }
     )

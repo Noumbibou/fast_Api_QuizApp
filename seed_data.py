@@ -12,11 +12,12 @@ def seed_questions():
     """Ajoute des questions de test dans la base de données avec le nouveau système de packs"""
     db = SessionLocal()
     try:
-        # Nettoyer les données existantes pour la migration
-        print("🧹 Nettoyage des données existantes...")
-        db.query(Question).delete()
-        db.query(QuestionSet).delete()
-        db.commit()
+        # Vérifier si des données existent déjà
+        existing_sets = db.query(QuestionSet).count()
+        if existing_sets > 0:
+            print(f"ℹ️  Base de données déjà remplie ({existing_sets} question sets existants)")
+            print("ℹ️  Seed ignoré - données persistantes")
+            return
         
         # Créer des question sets pour chaque niveau
         beginner_set = QuestionSet(

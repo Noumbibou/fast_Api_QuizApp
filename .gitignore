@@ -73,3 +73,4 @@ dmypy.json
 # OS
 Thumbs.db
 .DS_Store
+get_token.py

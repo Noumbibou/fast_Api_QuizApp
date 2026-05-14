@@ -205,7 +205,7 @@ def calculate_score(
     user=Depends(verify_firebase_token)
 ):
     """
-    Endpoint sécurisé pour calculer et enregistrer le score.
+    Endpoint sécurisé pour calculer et enregistrer le score avec système anti-triche.
     Le calcul se fait entièrement côté backend en utilisant les réponses mélangées.
     """
     try:
@@ -252,22 +252,72 @@ def calculate_score(
         if request.session_key in shuffled_answers_cache:
             del shuffled_answers_cache[request.session_key]
         
-        # Créer et sauvegarder le score
+        # ─────────────────────────────
+        # CALCUL DU SCORE DE SUSPICION (ANTI-TRICHE)
+        # ─────────────────────────────
+        cheat_score = 0
+        
+        # 1. Triche détectée par le frontend (+3 points)
+        if request.cheated:
+            cheat_score += 3
+        
+        # 2. Analyse du temps de réponse (+2 points si trop rapide)
+        # Seuil: moins de 1 seconde par question en moyenne
+        if request.time_spent > 0:
+            avg_time_per_question = request.time_spent / total_questions
+            if avg_time_per_question < 1.0:
+                cheat_score += 2
+        
+        # 3. Vérification caméra active (+1 point si inactive)
+        if not request.camera_active:
+            cheat_score += 1
+        
+        # 4. Vérification GPS (+1 point si position invalide ou manquante)
+        # Note: GPS optionnel, mais absence peut être suspecte
+        if request.latitude is None or request.longitude is None:
+            cheat_score += 1
+        
+        # ─────────────────────────────
+        # APPLICATION DES SANCTIONS
+        # ─────────────────────────────
+        flagged = False
+        final_score = correct_answers
+        
+        if cheat_score >= 3:
+            # Triche grave: score = 0
+            final_score = 0
+            flagged = True
+        elif cheat_score == 2:
+            # Triche modérée: score = 50%
+            final_score = int(correct_answers * 0.5)
+            flagged = True
+        
+        # ─────────────────────────────
+        # ENREGISTREMENT DU SCORE AVEC DONNÉES ANTI-TRICHE
+        # ─────────────────────────────
         score_record = Score(
             user_id=user["uid"],
             level=request.level.lower(),
-            score=correct_answers,
-            total=total_questions
+            score=final_score,
+            total=total_questions,
+            cheated=(cheat_score >= 3),
+            cheat_score=cheat_score,
+            time_spent=request.time_spent,
+            latitude=request.latitude,
+            longitude=request.longitude,
+            camera_active=request.camera_active
         )
         
         db.add(score_record)
         db.commit()
         db.refresh(score_record)
         
-        # Retourner le score calculé
+        # Retourner le score calculé avec indicateurs anti-triche
         return ScoreResponse(
-            score=correct_answers,
-            total=total_questions
+            score=final_score,
+            total=total_questions,
+            flagged=flagged,
+            cheat_score=cheat_score
         )
         
     except HTTPException:
