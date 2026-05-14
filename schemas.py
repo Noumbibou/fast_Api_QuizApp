@@ -5,12 +5,14 @@ from datetime import datetime
 class AnswerRequest(BaseModel):
     """Modèle pour la requête de calcul de score"""
     level: str
+    session_key: str  # Clé de session pour récupérer les réponses mélangées
     answers: List[dict]  # [{"question_id": 1, "selected": "C"}]
     
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "level": "beginner",
+                "session_key": "user123_beginner_1715580000",
                 "answers": [
                     {"question_id": 1, "selected": "C"},
                     {"question_id": 2, "selected": "B"}
@@ -149,6 +151,76 @@ class AdminActionResponse(BaseModel):
         }
     )
 
+# ========== ADMIN QUESTION SETS SCHEMAS ==========
+
+class QuestionSetCreate(BaseModel):
+    """Modèle pour la création d'un question set"""
+    name: str
+    level: str  # beginner, intermediate, advanced
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "name": "Pack Questions Mathématiques",
+                "level": "beginner"
+            }
+        }
+    )
+
+class QuestionSetResponse(BaseModel):
+    """Modèle pour la réponse question set"""
+    id: int
+    name: str
+    level: str
+    is_active: bool
+    created_at: datetime
+    question_count: int = 0
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": 1,
+                "name": "Pack Questions Mathématiques",
+                "level": "beginner",
+                "is_active": True,
+                "created_at": "2026-05-13T10:00:00",
+                "question_count": 50
+            }
+        }
+    )
+
+class QuestionSetActivateResponse(BaseModel):
+    """Modèle pour la réponse d'activation d'un question set"""
+    success: bool
+    message: str
+    set_id: int
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "message": "Pack activé avec succès",
+                "set_id": 1
+            }
+        }
+    )
+
+class QuestionSetDeleteResponse(BaseModel):
+    """Modèle pour la réponse de suppression d'un question set"""
+    success: bool
+    message: str
+    set_id: int
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "message": "Pack supprimé avec succès",
+                "set_id": 1
+            }
+        }
+    )
+
 # ========== ADMIN QUESTIONS SCHEMAS ==========
 
 class QuestionAdminCreate(BaseModel):
@@ -160,6 +232,7 @@ class QuestionAdminCreate(BaseModel):
     optionD: str
     correct: str  # A, B, C, or D
     level: str  # beginner, intermediate, advanced
+    set_id: int  # ID du question set
     
     model_config = ConfigDict(
         json_schema_extra={
@@ -170,7 +243,8 @@ class QuestionAdminCreate(BaseModel):
                 "optionC": "Berlin",
                 "optionD": "Madrid",
                 "correct": "B",
-                "level": "beginner"
+                "level": "beginner",
+                "set_id": 1
             }
         }
     )
@@ -184,6 +258,7 @@ class QuestionAdminUpdate(BaseModel):
     optionD: str
     correct: str
     level: str
+    set_id: int  # ID du question set
     
     model_config = ConfigDict(
         json_schema_extra={
@@ -194,7 +269,8 @@ class QuestionAdminUpdate(BaseModel):
                 "optionC": "Berlin",
                 "optionD": "Madrid",
                 "correct": "B",
-                "level": "beginner"
+                "level": "beginner",
+                "set_id": 1
             }
         }
     )
@@ -209,6 +285,7 @@ class QuestionAdminResponse(BaseModel):
     option_d: str
     correct_answer: str
     level: str
+    set_id: int
     is_active: bool
     
     model_config = ConfigDict(
@@ -222,6 +299,7 @@ class QuestionAdminResponse(BaseModel):
                 "option_d": "Madrid",
                 "correct_answer": "B",
                 "level": "beginner",
+                "set_id": 1,
                 "is_active": True
             }
         }

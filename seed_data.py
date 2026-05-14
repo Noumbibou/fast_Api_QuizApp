@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 from database import engine, Base, SessionLocal
-from models.question import Question, QuestionLevel
+from models.question import Question, QuestionLevel, QuestionSet
 from models.score import Score
 
 def create_tables():
@@ -9,19 +9,45 @@ def create_tables():
     print("✅ Tables créées avec succès")
 
 def seed_questions():
-    """Ajoute des questions de test dans la base de données"""
+    """Ajoute des questions de test dans la base de données avec le nouveau système de packs"""
     db = SessionLocal()
     try:
-        # Vérifier si des questions existent déjà
-        existing_questions = db.query(Question).count()
-        if existing_questions > 0:
-            print(f"ℹ️  {existing_questions} questions existent déjà dans la base")
-            return
+        # Nettoyer les données existantes pour la migration
+        print("🧹 Nettoyage des données existantes...")
+        db.query(Question).delete()
+        db.query(QuestionSet).delete()
+        db.commit()
         
-        # Questions de test pour chaque niveau
+        # Créer des question sets pour chaque niveau
+        beginner_set = QuestionSet(
+            name="Pack Questions Débutant",
+            level=QuestionLevel.BEGINNER,
+            is_active=True
+        )
+        
+        intermediate_set = QuestionSet(
+            name="Pack Questions Intermédiaire",
+            level=QuestionLevel.INTERMEDIATE,
+            is_active=True
+        )
+        
+        advanced_set = QuestionSet(
+            name="Pack Questions Avancé",
+            level=QuestionLevel.ADVANCED,
+            is_active=True
+        )
+        
+        db.add_all([beginner_set, intermediate_set, advanced_set])
+        db.commit()
+        db.refresh(beginner_set)
+        db.refresh(intermediate_set)
+        db.refresh(advanced_set)
+        
+        # Questions de test pour chaque niveau, attachées aux sets
         questions = [
             # Beginner questions
             Question(
+                set_id=beginner_set.id,
                 level=QuestionLevel.BEGINNER,
                 question="Quelle est la capitale de la France ?",
                 option_a="Londres",
@@ -31,6 +57,7 @@ def seed_questions():
                 correct_answer="C"
             ),
             Question(
+                set_id=beginner_set.id,
                 level=QuestionLevel.BEGINNER,
                 question="Combien font 2 + 2 ?",
                 option_a="3",
@@ -40,6 +67,7 @@ def seed_questions():
                 correct_answer="B"
             ),
             Question(
+                set_id=beginner_set.id,
                 level=QuestionLevel.BEGINNER,
                 question="Quelle couleur est le ciel ?",
                 option_a="Vert",
@@ -50,6 +78,7 @@ def seed_questions():
             ),
             # Intermediate questions
             Question(
+                set_id=intermediate_set.id,
                 level=QuestionLevel.INTERMEDIATE,
                 question="Quel est le plus grand océan du monde ?",
                 option_a="Atlantique",
@@ -59,6 +88,7 @@ def seed_questions():
                 correct_answer="D"
             ),
             Question(
+                set_id=intermediate_set.id,
                 level=QuestionLevel.INTERMEDIATE,
                 question="En quelle année a eu lieu la Révolution française ?",
                 option_a="1776",
@@ -69,6 +99,7 @@ def seed_questions():
             ),
             # Advanced questions
             Question(
+                set_id=advanced_set.id,
                 level=QuestionLevel.ADVANCED,
                 question="Quelle est la vitesse de la lumière dans le vide ?",
                 option_a="299 792 km/s",
@@ -78,6 +109,7 @@ def seed_questions():
                 correct_answer="A"
             ),
             Question(
+                set_id=advanced_set.id,
                 level=QuestionLevel.ADVANCED,
                 question="Quel est le symbole chimique de l'or ?",
                 option_a="Ag",
@@ -90,6 +122,7 @@ def seed_questions():
         
         db.add_all(questions)
         db.commit()
+        print(f"✅ 3 question sets créés avec succès")
         print(f"✅ {len(questions)} questions ajoutées avec succès")
         
     except Exception as e:

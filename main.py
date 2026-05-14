@@ -4,13 +4,14 @@ from sqlalchemy import func, desc
 from typing import List, Optional
 from auth.firebase import verify_firebase_token, require_admin
 from database import get_db
-from models.question import Question, QuestionLevel
+from models.question import Question, QuestionLevel, QuestionSet
 from models.score import Score
 from seed_data import init_database
 from schemas import (
     AnswerRequest, ScoreResponse, UserScoreResponse, LeaderboardEntry, StatsSummary,
     UserInfo, UserDetails, AdminActionResponse,
     QuestionAdminCreate, QuestionAdminUpdate, QuestionAdminResponse, QuestionAdminDeleteResponse,
+    QuestionSetCreate, QuestionSetResponse, QuestionSetActivateResponse, QuestionSetDeleteResponse,
     ImportError, ImportResponse,
     AIQuestionRequest, AIQuestionResponse
 )
@@ -61,6 +62,11 @@ def get_current_user(user=Depends(verify_firebase_token)):
     }
 
 
+# Cache en mémoire pour stocker les correspondances réponses mélangées
+# Format: {user_id_level_timestamp: {question_id: shuffled_correct_answer}}
+shuffled_answers_cache = {}
+import time
+
 @app.get("/quiz/questions")
 def get_questions(
     level: str = Query(..., description="Niveau de difficulté: beginner, intermediate, advanced"),
@@ -71,6 +77,8 @@ def get_questions(
     Endpoint sécurisé pour récupérer les questions de quiz.
     ✅ Randomisation serveur des questions et des options
     ✅ SANS envoyer correct_answer au client
+    ✅ Retourne uniquement les questions du pack ACTIF pour ce niveau
+    ✅ Garantit la correspondance correcte après randomisation
     """
     # ─────────────────────────────
     # Validation du niveau
@@ -84,21 +92,58 @@ def get_questions(
         )
 
     # ─────────────────────────────
-    # Récupération des questions
+    # Récupérer le pack actif pour ce niveau
+    # ─────────────────────────────
+    active_set = db.query(QuestionSet).filter(
+        QuestionSet.level == question_level,
+        QuestionSet.is_active == True
+    ).first()
+    
+    if not active_set:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Aucun pack actif trouvé pour le niveau {level}"
+        )
+
+    # ─────────────────────────────
+    # Récupération des questions du pack actif
     # ─────────────────────────────
     questions = db.query(Question).filter(
-        Question.level == question_level,
+        Question.set_id == active_set.id,
         Question.is_active == True  # Exclure les questions désactivées
     ).all()
+    
+    if not questions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Aucune question disponible dans le pack actif pour le niveau {level}"
+        )
 
     # ✅ Randomisation de l'ordre des questions
     random.shuffle(questions)
 
+    # Générer une clé unique pour cette session de quiz
+    session_key = f"{user['uid']}_{level.lower()}_{int(time.time())}"
+    
+    # Stocker les correspondances réponses mélangées
+    session_answers = {}
+    
     android_questions = []
 
     for q in questions:
         # ─────────────────────────
-        # Regrouper les options
+        # 1. Récupérer le texte de la bonne réponse originale
+        # ─────────────────────────
+        original_correct_letter = q.correct_answer.upper()
+        correct_answer_text = {
+            "A": q.option_a,
+            "B": q.option_b,
+            "C": q.option_c,
+            "D": q.option_d
+        }[original_correct_letter]
+        
+        # ─────────────────────────
+        # 2. Regrouper les options avec leurs labels
         # ─────────────────────────
         options = [
             ("A", q.option_a),
@@ -107,16 +152,33 @@ def get_questions(
             ("D", q.option_d),
         ]
 
-        # ✅ Randomisation des options
+        # ─────────────────────────
+        # 3. Randomiser les options
+        # ─────────────────────────
         random.shuffle(options)
 
-        # Reconstruction A/B/C/D
+        # ─────────────────────────
+        # 4. Reconstruire les options A/B/C/D
+        # ─────────────────────────
         shuffled_options = {
             "A": options[0][1],
             "B": options[1][1],
             "C": options[2][1],
             "D": options[3][1],
         }
+        
+        # ─────────────────────────
+        # 5. Retrouver la nouvelle lettre de la bonne réponse
+        # ─────────────────────────
+        for letter, text in shuffled_options.items():
+            if text == correct_answer_text:
+                shuffled_correct_answer = letter
+                break
+        
+        # ─────────────────────────
+        # 6. Stocker la correspondance pour le calcul du score
+        # ─────────────────────────
+        session_answers[q.id] = shuffled_correct_answer
 
         android_questions.append({
             "id": q.id,
@@ -126,8 +188,15 @@ def get_questions(
             "optionC": shuffled_options["C"],
             "optionD": shuffled_options["D"],
         })
-
-    return android_questions
+    
+    # Stocker la session dans le cache
+    shuffled_answers_cache[session_key] = session_answers
+    
+    # Retourner les questions avec la clé de session
+    return {
+        "session_key": session_key,
+        "questions": android_questions
+    }
 
 @app.post("/quiz/score", response_model=ScoreResponse)
 def calculate_score(
@@ -137,7 +206,7 @@ def calculate_score(
 ):
     """
     Endpoint sécurisé pour calculer et enregistrer le score.
-    Le calcul se fait entièrement côté backend.
+    Le calcul se fait entièrement côté backend en utilisant les réponses mélangées.
     """
     try:
         # Valider le niveau
@@ -147,6 +216,14 @@ def calculate_score(
             raise HTTPException(
                 status_code=400,
                 detail="Niveau invalide. Valeurs possibles: beginner, intermediate, advanced"
+            )
+        
+        # Récupérer les réponses mélangées depuis le cache
+        session_answers = shuffled_answers_cache.get(request.session_key)
+        if not session_answers:
+            raise HTTPException(
+                status_code=400,
+                detail="Session de quiz invalide ou expirée"
             )
         
         # Initialiser le score
@@ -161,18 +238,19 @@ def calculate_score(
             if not question_id or not selected_answer:
                 continue  # Ignorer les réponses invalides
             
-            # Récupérer la question depuis la base
-            question = db.query(Question).filter(
-                Question.id == question_id,
-                Question.level == question_level
-            ).first()
+            # Récupérer la bonne réponse mélangée depuis le cache
+            shuffled_correct_answer = session_answers.get(question_id)
             
-            if not question:
-                continue  # Ignorer si la question n'existe pas
+            if not shuffled_correct_answer:
+                continue  # Ignorer si la question n'est pas dans la session
             
-            # Comparer avec la bonne réponse
-            if question.correct_answer.upper() == selected_answer.upper():
+            # Comparer avec la bonne réponse mélangée
+            if shuffled_correct_answer.upper() == selected_answer.upper():
                 correct_answers += 1
+        
+        # Nettoyer le cache après utilisation
+        if request.session_key in shuffled_answers_cache:
+            del shuffled_answers_cache[request.session_key]
         
         # Créer et sauvegarder le score
         score_record = Score(
@@ -593,6 +671,412 @@ def revoke_admin(
         raise HTTPException(status_code=500, detail=f"Erreur lors du retrait du rôle admin: {str(e)}")
 
 
+# ========== ADMIN QUESTION SETS ENDPOINTS ==========
+
+@app.post("/admin/question-sets", response_model=QuestionSetResponse)
+def create_question_set(
+    set_data: QuestionSetCreate,
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Crée un nouveau pack de questions (admin uniquement).
+    """
+    try:
+        # Valider le niveau
+        try:
+            level_enum = QuestionLevel(set_data.level.lower())
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Niveau invalide: {set_data.level}")
+        
+        # Créer le question set
+        new_set = QuestionSet(
+            name=set_data.name,
+            level=level_enum,
+            is_active=False
+        )
+        
+        db.add(new_set)
+        db.commit()
+        db.refresh(new_set)
+        
+        return QuestionSetResponse(
+            id=new_set.id,
+            name=new_set.name,
+            level=new_set.level.value,
+            is_active=new_set.is_active,
+            created_at=new_set.created_at,
+            question_count=0
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création du pack: {str(e)}")
+
+
+@app.get("/admin/question-sets", response_model=List[QuestionSetResponse])
+def list_question_sets(
+    level: Optional[str] = Query(None, description="Filtrer par niveau (beginner, intermediate, advanced)"),
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Liste tous les packs de questions (admin uniquement).
+    Filtre possible par niveau.
+    """
+    try:
+        query = db.query(QuestionSet)
+        
+        # Filtrer par niveau si spécifié
+        if level:
+            try:
+                level_enum = QuestionLevel(level.lower())
+                query = query.filter(QuestionSet.level == level_enum)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Niveau invalide: {level}")
+        
+        sets = query.order_by(QuestionSet.id).all()
+        
+        # Compter les questions pour chaque set
+        result = []
+        for s in sets:
+            question_count = db.query(Question).filter(Question.set_id == s.id).count()
+            result.append(QuestionSetResponse(
+                id=s.id,
+                name=s.name,
+                level=s.level.value,
+                is_active=s.is_active,
+                created_at=s.created_at,
+                question_count=question_count
+            ))
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des packs: {str(e)}")
+
+
+@app.put("/admin/question-sets/{set_id}/activate", response_model=QuestionSetActivateResponse)
+def activate_question_set(
+    set_id: int,
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Active un pack de questions (admin uniquement).
+    Désactive automatiquement les autres packs du même niveau.
+    """
+    try:
+        # Récupérer le set à activer
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+        
+        # Désactiver tous les sets du même niveau
+        db.query(QuestionSet).filter(
+            QuestionSet.level == question_set.level,
+            QuestionSet.id != set_id
+        ).update({"is_active": False})
+        
+        # Activer le set demandé
+        question_set.is_active = True
+        db.commit()
+        
+        return QuestionSetActivateResponse(
+            success=True,
+            message="Pack activé avec succès",
+            set_id=set_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'activation du pack: {str(e)}")
+
+
+@app.delete("/admin/question-sets/{set_id}", response_model=QuestionSetDeleteResponse)
+def delete_question_set(
+    set_id: int,
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Supprime un pack de questions (admin uniquement).
+    Supprime également toutes les questions du pack (cascade delete).
+    """
+    try:
+        # Récupérer le set
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+        
+        # Empêcher la suppression d'un pack actif
+        if question_set.is_active:
+            raise HTTPException(status_code=400, detail="Impossible de supprimer un pack actif")
+        
+        # Supprimer le set (cascade delete supprimera les questions)
+        db.delete(question_set)
+        db.commit()
+        
+        return QuestionSetDeleteResponse(
+            success=True,
+            message="Pack supprimé avec succès",
+            set_id=set_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la suppression du pack: {str(e)}")
+
+
+@app.get("/admin/question-sets/{set_id}/questions", response_model=List[QuestionAdminResponse])
+def list_questions_in_set(
+    set_id: int,
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Liste toutes les questions d'un pack (admin uniquement).
+    """
+    try:
+        # Vérifier que le set existe
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+        
+        questions = db.query(Question).filter(Question.set_id == set_id).order_by(Question.id).all()
+        
+        return [
+            QuestionAdminResponse(
+                id=q.id,
+                question=q.question,
+                option_a=q.option_a,
+                option_b=q.option_b,
+                option_c=q.option_c,
+                option_d=q.option_d,
+                correct_answer=q.correct_answer,
+                level=q.level.value,
+                set_id=q.set_id,
+                is_active=q.is_active
+            )
+            for q in questions
+        ]
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des questions: {str(e)}")
+
+
+@app.post("/admin/question-sets/{set_id}/questions", response_model=QuestionAdminResponse)
+def create_question_in_set(
+    set_id: int,
+    question_data: QuestionAdminCreate,
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Crée une question dans un pack (admin uniquement).
+    """
+    try:
+        # Vérifier que le set existe
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+        
+        # Valider le niveau
+        try:
+            level_enum = QuestionLevel(question_data.level.lower())
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Niveau invalide: {question_data.level}")
+        
+        # Valider que correct_answer est A, B, C ou D
+        if question_data.correct.upper() not in ["A", "B", "C", "D"]:
+            raise HTTPException(status_code=400, detail="La réponse correcte doit être A, B, C ou D")
+        
+        # Créer la question
+        new_question = Question(
+            question=question_data.question,
+            option_a=question_data.optionA,
+            option_b=question_data.optionB,
+            option_c=question_data.optionC,
+            option_d=question_data.optionD,
+            correct_answer=question_data.correct.upper(),
+            level=level_enum,
+            set_id=set_id,
+            is_active=True
+        )
+        
+        db.add(new_question)
+        db.commit()
+        db.refresh(new_question)
+        
+        return QuestionAdminResponse(
+            id=new_question.id,
+            question=new_question.question,
+            option_a=new_question.option_a,
+            option_b=new_question.option_b,
+            option_c=new_question.option_c,
+            option_d=new_question.option_d,
+            correct_answer=new_question.correct_answer,
+            level=new_question.level.value,
+            set_id=new_question.set_id,
+            is_active=new_question.is_active
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la question: {str(e)}")
+
+
+@app.post("/admin/question-sets/{set_id}/import", response_model=ImportResponse)
+def import_questions_in_set(
+    set_id: int,
+    file: UploadFile = File(..., description="Fichier Excel (.xlsx)"),
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    try:
+        # ✅ Vérifier que le pack existe
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+
+        # ✅ Vérifier le fichier
+        if not file.filename.endswith('.xlsx'):
+            raise HTTPException(status_code=400, detail="Seuls les fichiers .xlsx sont acceptés")
+
+        import openpyxl
+        from io import BytesIO
+
+        workbook = openpyxl.load_workbook(BytesIO(file.file.read()))
+        sheet = workbook.active
+
+        total_rows = 0
+        imported = 0
+        failed = 0
+        errors = []
+
+        rows = list(sheet.iter_rows(min_row=2, values_only=True))
+        total_rows = len(rows)
+
+        for row_index, row in enumerate(rows, start=2):
+            try:
+                print("ROW DEBUG:", row)  # ✅ Debug utile
+
+                # ✅ Vérifier longueur
+                if len(row) < 7:
+                    errors.append(ImportError(row=row_index, message="Colonne manquante"))
+                    failed += 1
+                    continue
+
+                # ✅ Lecture sécurisée (FIX CRITIQUE)
+                level = str(row[0]).strip() if row[0] else ""
+                question = str(row[1]).strip() if row[1] else ""
+                option_a = str(row[2]).strip() if row[2] else ""
+                option_b = str(row[3]).strip() if row[3] else ""
+                option_c = str(row[4]).strip() if row[4] else ""
+                option_d = str(row[5]).strip() if row[5] else ""
+                correct = str(row[6]).strip() if row[6] else ""
+
+                # ✅ Validation champs
+                if not level:
+                    errors.append(ImportError(row=row_index, message="Niveau manquant"))
+                    failed += 1
+                    continue
+
+                if not question:
+                    errors.append(ImportError(row=row_index, message="Question manquante"))
+                    failed += 1
+                    continue
+
+                if not all([option_a, option_b, option_c, option_d]):
+                    errors.append(ImportError(row=row_index, message="Options manquantes"))
+                    failed += 1
+                    continue
+
+                if not correct:
+                    errors.append(ImportError(row=row_index, message="Réponse correcte manquante"))
+                    failed += 1
+                    continue
+
+                # ✅ Normalisation niveau (FIX PRO)
+                level_str = level.lower()
+
+                level_mapping = {
+                    "beginner": "beginner",
+                    "debutant": "beginner",
+                    "débutant": "beginner",
+                    "intermediate": "intermediate",
+                    "advanced": "advanced",
+                    "avance": "advanced",
+                    "avancé": "advanced"
+                }
+
+                if level_str not in level_mapping:
+                    errors.append(ImportError(
+                        row=row_index,
+                        message=f"Niveau invalide: {level}"
+                    ))
+                    failed += 1
+                    continue
+
+                level_enum = QuestionLevel(level_mapping[level_str])
+
+                # ✅ Validation réponse correcte
+                correct_upper = correct.upper()
+
+                if correct_upper not in ["A", "B", "C", "D"]:
+                    errors.append(ImportError(
+                        row=row_index,
+                        message=f"Réponse correcte invalide: {correct}"
+                    ))
+                    failed += 1
+                    continue
+
+                # ✅ Création question
+                new_question = Question(
+                    question=question,
+                    option_a=option_a,
+                    option_b=option_b,
+                    option_c=option_c,
+                    option_d=option_d,
+                    correct_answer=correct_upper,
+                    level=level_enum,
+                    set_id=set_id,
+                    is_active=True
+                )
+
+                db.add(new_question)
+                imported += 1
+
+            except Exception as e:
+                print("❌ ERROR ON ROW:", row_index, str(e))
+                errors.append(ImportError(row=row_index, message=str(e)))
+                failed += 1
+
+        db.commit()
+
+        return ImportResponse(
+            success=True,
+            total_rows=total_rows,
+            imported=imported,
+            failed=failed,
+            errors=errors
+        )
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de l'import: {str(e)}")
 # ========== ADMIN QUESTIONS ENDPOINTS ==========
 
 @app.get("/admin/questions", response_model=List[QuestionAdminResponse])
@@ -629,6 +1113,7 @@ def list_admin_questions(
                 option_d=q.option_d,
                 correct_answer=q.correct_answer,
                 level=q.level.value,
+                set_id=q.set_id,
                 is_active=q.is_active
             )
             for q in questions
@@ -661,6 +1146,11 @@ def create_question(
         if question_data.correct.upper() not in ["A", "B", "C", "D"]:
             raise HTTPException(status_code=400, detail="La réponse correcte doit être A, B, C ou D")
         
+        # Vérifier que le set existe
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == question_data.set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+        
         # Créer la question
         new_question = Question(
             question=question_data.question,
@@ -670,6 +1160,7 @@ def create_question(
             option_d=question_data.optionD,
             correct_answer=question_data.correct.upper(),
             level=level_enum,
+            set_id=question_data.set_id,
             is_active=True
         )
         
@@ -686,6 +1177,7 @@ def create_question(
             option_d=new_question.option_d,
             correct_answer=new_question.correct_answer,
             level=new_question.level.value,
+            set_id=new_question.set_id,
             is_active=new_question.is_active
         )
         
@@ -723,6 +1215,11 @@ def update_question(
         if question_data.correct.upper() not in ["A", "B", "C", "D"]:
             raise HTTPException(status_code=400, detail="La réponse correcte doit être A, B, C ou D")
         
+        # Vérifier que le set existe
+        question_set = db.query(QuestionSet).filter(QuestionSet.id == question_data.set_id).first()
+        if not question_set:
+            raise HTTPException(status_code=404, detail="Pack non trouvé")
+        
         # Mettre à jour les champs
         question.question = question_data.question
         question.option_a = question_data.optionA
@@ -731,6 +1228,7 @@ def update_question(
         question.option_d = question_data.optionD
         question.correct_answer = question_data.correct.upper()
         question.level = level_enum
+        question.set_id = question_data.set_id
         
         db.commit()
         db.refresh(question)
@@ -744,6 +1242,7 @@ def update_question(
             option_d=question.option_d,
             correct_answer=question.correct_answer,
             level=question.level.value,
+            set_id=question.set_id,
             is_active=question.is_active
         )
         
@@ -785,143 +1284,6 @@ def delete_question(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Erreur lors de la désactivation de la question: {str(e)}")
-
-
-@app.post("/admin/questions/import", response_model=ImportResponse)
-def import_questions_excel(
-    file: UploadFile = File(..., description="Fichier Excel (.xlsx)"),
-    db: Session = Depends(get_db),
-    admin_user=Depends(require_admin)
-):
-    """
-    Importe des questions depuis un fichier Excel (admin uniquement).
-    Format attendu: level, question, optionA, optionB, optionC, optionD, correct
-    """
-    try:
-        # Valider le type de fichier
-        if not file.filename.endswith('.xlsx'):
-            raise HTTPException(
-                status_code=400,
-                detail="Type de fichier invalide. Seuls les fichiers .xlsx sont acceptés"
-            )
-        
-        # Lire le fichier Excel
-        import openpyxl
-        from io import BytesIO
-        
-        contents = file.file.read()
-        workbook = openpyxl.load_workbook(BytesIO(contents))
-        sheet = workbook.active
-        
-        # Variables de suivi
-        total_rows = 0
-        imported = 0
-        failed = 0
-        errors = []
-        
-        # Ignorer la ligne d'en-tête (première ligne)
-        rows = list(sheet.iter_rows(min_row=2, values_only=True))
-        total_rows = len(rows)
-        
-        # Traiter chaque ligne
-        for row_index, row in enumerate(rows, start=2):  # start=2 car on ignore l'en-tête
-            try:
-                # Vérifier que la ligne a 7 colonnes
-                if len(row) < 7:
-                    errors.append(ImportError(row=row_index, message="Colonne manquante"))
-                    failed += 1
-                    continue
-                
-                level, question, option_a, option_b, option_c, option_d, correct = row[0:7]
-                
-                # Validation des champs
-                if not level or not str(level).strip():
-                    errors.append(ImportError(row=row_index, message="Niveau manquant"))
-                    failed += 1
-                    continue
-                
-                if not question or not str(question).strip():
-                    errors.append(ImportError(row=row_index, message="Question manquante"))
-                    failed += 1
-                    continue
-                
-                if not option_a or not str(option_a).strip():
-                    errors.append(ImportError(row=row_index, message="Option A manquante"))
-                    failed += 1
-                    continue
-                
-                if not option_b or not str(option_b).strip():
-                    errors.append(ImportError(row=row_index, message="Option B manquante"))
-                    failed += 1
-                    continue
-                
-                if not option_c or not str(option_c).strip():
-                    errors.append(ImportError(row=row_index, message="Option C manquante"))
-                    failed += 1
-                    continue
-                
-                if not option_d or not str(option_d).strip():
-                    errors.append(ImportError(row=row_index, message="Option D manquante"))
-                    failed += 1
-                    continue
-                
-                if not correct or not str(correct).strip():
-                    errors.append(ImportError(row=row_index, message="Réponse correcte manquante"))
-                    failed += 1
-                    continue
-                
-                # Validation du niveau
-                try:
-                    level_enum = QuestionLevel(str(level).strip().lower())
-                except ValueError:
-                    errors.append(ImportError(row=row_index, message=f"Niveau invalide: {level}"))
-                    failed += 1
-                    continue
-                
-                # Validation de la réponse correcte
-                correct_upper = str(correct).strip().upper()
-                if correct_upper not in ["A", "B", "C", "D"]:
-                    errors.append(ImportError(row=row_index, message=f"Réponse correcte invalide: {correct}"))
-                    failed += 1
-                    continue
-                
-                # Créer la question
-                new_question = Question(
-                    question=str(question).strip(),
-                    option_a=str(option_a).strip(),
-                    option_b=str(option_b).strip(),
-                    option_c=str(option_c).strip(),
-                    option_d=str(option_d).strip(),
-                    correct_answer=correct_upper,
-                    level=level_enum,
-                    is_active=True
-                )
-                
-                db.add(new_question)
-                imported += 1
-                
-            except Exception as e:
-                errors.append(ImportError(row=row_index, message=f"Erreur inattendue: {str(e)}"))
-                failed += 1
-                continue
-        
-        # Commit toutes les questions valides
-        if imported > 0:
-            db.commit()
-        
-        return ImportResponse(
-            success=True,
-            total_rows=total_rows,
-            imported=imported,
-            failed=failed,
-            errors=errors
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Erreur lors de l'import Excel: {str(e)}")
 
 
 @app.post("/admin/questions/generate", response_model=AIQuestionResponse)
