@@ -13,7 +13,8 @@ from schemas import (
     QuestionAdminCreate, QuestionAdminUpdate, QuestionAdminResponse, QuestionAdminDeleteResponse,
     QuestionSetCreate, QuestionSetResponse, QuestionSetActivateResponse, QuestionSetDeleteResponse,
     ImportError, ImportResponse,
-    AIQuestionRequest, AIQuestionResponse
+    AIQuestionRequest, AIQuestionResponse,
+    FraudReport
 )
 from contextlib import asynccontextmanager
 import firebase_admin
@@ -257,8 +258,14 @@ def calculate_score(
         # ─────────────────────────────
         cheat_score = 0
         
+        print("FACE VERIFIED:", request.face_verified)
+        
         # 1. Triche détectée par le frontend (+3 points)
         if request.cheated:
+            cheat_score += 3
+            
+        # Vérification faciale ML Kit (+3 points si visage non vérifié/changé)
+        if not request.face_verified:
             cheat_score += 3
         
         # 2. Analyse du temps de réponse (+2 points si trop rapide)
@@ -379,15 +386,39 @@ def get_leaderboard(
             Score.level == level.lower()
         ).order_by(desc(Score.score), desc(Score.created_at)).limit(10).all()
         
-        return [
-            LeaderboardEntry(
-                user_id=score.user_id,
-                score=score.score,
-                total=score.total,
-                created_at=score.created_at
+        # Cache pour éviter d'appeler Firebase plusieurs fois pour le même utilisateur
+        usernames_cache = {}
+        
+        leaderboard_entries = []
+        for score in scores:
+            # Récupérer le username depuis le cache ou Firebase
+            if score.user_id in usernames_cache:
+                username = usernames_cache[score.user_id]
+            else:
+                try:
+                    user_record = firebase_auth.get_user(score.user_id)
+                    # Extraire le nom : display_name ou email prefix
+                    if user_record.display_name:
+                        username = user_record.display_name
+                    elif user_record.email:
+                        username = user_record.email.split("@")[0]
+                    else:
+                        username = "Unknown"
+                    usernames_cache[score.user_id] = username
+                except Exception:
+                    username = "Unknown"
+            
+            leaderboard_entries.append(
+                LeaderboardEntry(
+                    user_id=score.user_id,
+                    username=username,
+                    score=score.score,
+                    total=score.total,
+                    created_at=score.created_at
+                )
             )
-            for score in scores
-        ]
+        
+        return leaderboard_entries
         
     except HTTPException:
         raise
@@ -481,6 +512,57 @@ def get_my_summary(
 
 
 # ========== ADMIN ENDPOINTS ==========
+
+@app.get("/admin/frauds", response_model=List[FraudReport])
+def get_fraud_reports(
+    db: Session = Depends(get_db),
+    admin_user=Depends(require_admin)
+):
+    """
+    Endpoint protégé par le rôle admin.
+    Retourne la liste des scores filtrés sur cheated == True, triés par date décroissante.
+    Inclut l'email de l'utilisateur dans la réponse.
+    """
+    try:
+        # Récupérer les scores frauduleux, triés par date décroissante
+        fraud_scores = db.query(Score).filter(
+            Score.cheated == True
+        ).order_by(desc(Score.created_at)).all()
+        
+        reports = []
+        # Cache simple en mémoire pour éviter d'appeler Firebase pour le même utilisateur plusieurs fois
+        user_emails = {}
+        
+        for score in fraud_scores:
+            email = None
+            if score.user_id in user_emails:
+                email = user_emails[score.user_id]
+            else:
+                try:
+                    user_record = firebase_auth.get_user(score.user_id)
+                    email = user_record.email
+                    user_emails[score.user_id] = email
+                except Exception:
+                    # Ignore s'il y a une erreur ou si l'utilisateur n'existe plus
+                    pass
+                
+            reports.append(FraudReport(
+                score=score.score,
+                total=score.total,
+                level=score.level,
+                created_at=score.created_at,
+                email=email,
+                time_spent=score.time_spent,
+                cheat_score=score.cheat_score,
+                latitude=score.latitude,
+                longitude=score.longitude,
+                camera_active=score.camera_active
+            ))
+            
+        return reports
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération des fraudes: {str(e)}")
 
 @app.get("/admin/users", response_model=List[UserInfo])
 def list_users(

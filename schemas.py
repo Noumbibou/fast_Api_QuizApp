@@ -14,6 +14,7 @@ class AnswerRequest(BaseModel):
     latitude: Optional[float] = None  # Position GPS
     longitude: Optional[float] = None  # Position GPS
     camera_active: bool = True  # Caméra active pendant le quiz
+    face_verified: bool = True  # Vérification du visage par ML Kit
     
     model_config = ConfigDict(
         json_schema_extra={
@@ -28,7 +29,8 @@ class AnswerRequest(BaseModel):
                 "time_spent": 30,
                 "latitude": 48.8566,
                 "longitude": 2.3522,
-                "camera_active": True
+                "camera_active": True,
+                "face_verified": True
             }
         }
     )
@@ -69,9 +71,36 @@ class UserScoreResponse(BaseModel):
         }
     )
 
+class FraudReport(UserScoreResponse):
+    """Modèle pour le rapport de fraude avec détails techniques"""
+    email: Optional[str] = None
+    time_spent: int = 0
+    cheat_score: int = 0
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    camera_active: bool = True
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "score": 0,
+                "total": 10,
+                "level": "beginner",
+                "created_at": "2026-05-08T10:22:00",
+                "email": "cheater@example.com",
+                "time_spent": 12,
+                "cheat_score": 4,
+                "latitude": 48.8566,
+                "longitude": 2.3522,
+                "camera_active": False
+            }
+        }
+    )
+
 class LeaderboardEntry(BaseModel):
     """Modèle pour une entrée du classement"""
     user_id: str
+    username: str
     score: int
     total: int
     created_at: datetime
@@ -80,6 +109,7 @@ class LeaderboardEntry(BaseModel):
         json_schema_extra={
             "example": {
                 "user_id": "firebase_uid_123",
+                "username": "William",
                 "score": 9,
                 "total": 10,
                 "created_at": "2026-05-08T10:22:00"

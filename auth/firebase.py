@@ -24,8 +24,7 @@ def verify_firebase_token(
     token = credentials.credentials
 
     try:
-        decoded_token = auth.verify_id_token(token)
-        
+        decoded_token = auth.verify_id_token(token, clock_skew_seconds=10)        
         # Vérifier si l'utilisateur est désactivé par un admin
         if decoded_token.get("disabled", False):
             raise HTTPException(
@@ -69,8 +68,7 @@ def require_admin(
     token = credentials.credentials
 
     try:
-        decoded_token = auth.verify_id_token(token, check_revoked=True)
-        
+        decoded_token = auth.verify_id_token(token, check_revoked=True, clock_skew_seconds=10)        
         # Vérifier le custom claim admin
         if not decoded_token.get("admin", False):
             raise HTTPException(
