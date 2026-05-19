@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from database import engine, Base, SessionLocal
 from models.question import Question, QuestionLevel, QuestionSet
 from models.score import Score
+from models.user import User
 
 def create_tables():
     """Crée toutes les tables dans la base de données"""

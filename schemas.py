@@ -133,6 +133,19 @@ class StatsSummary(BaseModel):
         }
     )
 
+class UserUpdateProfileRequest(BaseModel):
+    """Modèle pour la requête de mise à jour du profil (username)"""
+    username: str
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "username": "William"
+            }
+        }
+    )
+
+
 # ========== ADMIN SCHEMAS ==========
 
 class UserInfo(BaseModel):

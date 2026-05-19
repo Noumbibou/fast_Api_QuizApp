@@ -6,6 +6,7 @@ from auth.firebase import verify_firebase_token, require_admin
 from database import get_db
 from models.question import Question, QuestionLevel, QuestionSet
 from models.score import Score
+from models.user import User
 from seed_data import init_database
 from schemas import (
     AnswerRequest, ScoreResponse, UserScoreResponse, LeaderboardEntry, StatsSummary,
@@ -14,7 +15,7 @@ from schemas import (
     QuestionSetCreate, QuestionSetResponse, QuestionSetActivateResponse, QuestionSetDeleteResponse,
     ImportError, ImportResponse,
     AIQuestionRequest, AIQuestionResponse,
-    FraudReport
+    FraudReport, UserUpdateProfileRequest
 )
 from contextlib import asynccontextmanager
 import firebase_admin
@@ -61,6 +62,47 @@ def get_current_user(user=Depends(verify_firebase_token)):
         "provider": user.get("firebase", {}).get("sign_in_provider"),
         "admin": user.get("admin", False)
     }
+
+
+@app.put("/user/update-profile")
+def update_profile(
+    request: UserUpdateProfileRequest,
+    db: Session = Depends(get_db),
+    user=Depends(verify_firebase_token)
+):
+    """
+    Enregistre et synchronise le nom d'utilisateur dans la base locale et Firebase.
+    """
+    try:
+        uid = user["uid"]
+        
+        # 1. Mettre à jour la base de données locale
+        user_record = db.query(User).filter(User.uid == uid).first()
+        if not user_record:
+            user_record = User(uid=uid, username=request.username)
+            db.add(user_record)
+        else:
+            user_record.username = request.username
+        
+        db.commit()
+        db.refresh(user_record)
+        
+        # 2. Mettre à jour Firebase Display Name (Optionnel mais recommandé/demandé)
+        try:
+            firebase_auth.update_user(uid, display_name=request.username)
+        except Exception as fb_err:
+            print(f"⚠️ Erreur lors de la mise à jour de Firebase display_name: {fb_err}")
+            
+        return {
+            "success": True,
+            "message": "Profil mis à jour avec succès",
+            "username": user_record.username,
+            "uid": uid
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour du profil: {str(e)}")
+
 
 
 # Cache en mémoire pour stocker les correspondances réponses mélangées
@@ -386,27 +428,33 @@ def get_leaderboard(
             Score.level == level.lower()
         ).order_by(desc(Score.score), desc(Score.created_at)).limit(10).all()
         
-        # Cache pour éviter d'appeler Firebase plusieurs fois pour le même utilisateur
+        # Cache pour éviter d'appeler la base locale ou Firebase plusieurs fois
         usernames_cache = {}
         
         leaderboard_entries = []
         for score in scores:
-            # Récupérer le username depuis le cache ou Firebase
+            # Récupérer le username depuis le cache, la DB locale ou Firebase
             if score.user_id in usernames_cache:
                 username = usernames_cache[score.user_id]
             else:
-                try:
-                    user_record = firebase_auth.get_user(score.user_id)
-                    # Extraire le nom : display_name ou email prefix
-                    if user_record.display_name:
-                        username = user_record.display_name
-                    elif user_record.email:
-                        username = user_record.email.split("@")[0]
-                    else:
+                # 1. Essayer de récupérer le username depuis la base locale
+                local_user = db.query(User).filter(User.uid == score.user_id).first()
+                if local_user and local_user.username:
+                    username = local_user.username
+                else:
+                    # 2. Sinon, fallback sur Firebase Auth
+                    try:
+                        user_record = firebase_auth.get_user(score.user_id)
+                        if user_record.display_name:
+                            username = user_record.display_name
+                        elif user_record.email:
+                            username = user_record.email.split("@")[0]
+                        else:
+                            username = "Unknown"
+                    except Exception:
                         username = "Unknown"
-                    usernames_cache[score.user_id] = username
-                except Exception:
-                    username = "Unknown"
+                
+                usernames_cache[score.user_id] = username
             
             leaderboard_entries.append(
                 LeaderboardEntry(
